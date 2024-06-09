@@ -120,7 +120,17 @@ h, w, _ = lastframe.shape
 vid_out = None
 if not os.path.exists(interp_output_path):
     os.mkdir(interp_output_path)
-    
+
+
+def avg_frames(user_args, write_buffer, lastframe, cpuOut, framenum, exitmutex):
+    avg_image = lastframe.astype(np.float)
+    for mid in cpuOut:
+        mid = ((mid.numpy().transpose(1, 2, 0)))
+        avg_image += mid.astype(np.float)[:h, :w]
+    avg_image /= len(cpuOut) + 1
+    write_buffer.put([framenum, avg_image.astype(np.uint8)[:h, :w]])
+    exitmutex.acquire()
+
 
 def clear_write_buffer(user_args, write_buffer, thread_id):
     os.chdir(interp_output_path)
@@ -142,13 +152,15 @@ def build_read_buffer(user_args, read_buffer, videogen):
             frame = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
         read_buffer.put(frame)
     read_buffer.put(None)
+    read_buffer.put(None) # additional empty frames to prevent lock when looking ahead for deduplication
+    read_buffer.put(None)
 
-def make_inference(I0, I1, n):    
+def make_inference(I0, I1, n, amt = 1.):    
     global model
     if hasattr(model, 'version') and model.version >= 3.9:
         res = []
         for i in range(n):
-            res.append(model.inference(I0, I1, (i+1) * 1. / (n+1), args.scale))
+            res.append(model.inference(I0, I1, amt * (i+1) * 1. / (n+1), args.scale))
         return res
     else:
         middle = model.inference(I0, I1, args.scale)
@@ -166,6 +178,11 @@ def pad_image(img):
         return F.pad(img, padding).half()
     else:
         return F.pad(img, padding)
+    
+def compareImg(imageA, imageB):
+    err = np.sum((imageA.astype("float") - imageB.astype("float")) ** 2)
+    err /= float(imageA.shape[0] * imageA.shape[1])
+    return err
 
 print(f"Using scale {args.scale}.")
 tmp = max(128, int(128 / args.scale))
@@ -182,27 +199,60 @@ for x in range(args.wthreads):
 
 I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
+exitmutexes = []
+nextFrame = None
 
 while True:
-    frame = read_buffer.get()
+    if (nextFrame is None):
+        frame = read_buffer.get()
+    else:
+        frame = nextFrame
+        nextFrame = None
+    
     if frame is None:
         break
+
+#    print(f"Frame difference {compareImg(frame, lastframe)}.")
+    
     I0 = I1
+
+    if (args.multi == 1 and compareImg(frame, lastframe) < 10): # duplicate frame
+        nextFrame = read_buffer.get()
+        if nextFrame is not None:
+            I1 = torch.from_numpy(np.transpose(nextFrame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+            I1 = pad_image(I1)
+            output = make_inference(I0, I1, 2-1)
+            for mid in output:
+                frame = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))[:h, :w]
+ 
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
 
-    output = make_inference(I0, I1, args.multi-1)
-    write_buffer.put([cnt, lastframe])
-    cnt += 1
-    for mid in output:
-        mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
-        # print(f"Adding #{cnt} to buffer.")
-        write_buffer.put([cnt, mid[:h, :w]])
+    if (args.multi == 1): # Motion blur x16 100%
+        output = make_inference(I0, I1, 16-1, 1.00)
+        cpuOut = []
+        for mid in output:
+            cpuOut.append((mid[0] * 255.).byte().cpu())
+        exitmutexes.append(_thread.allocate_lock())
+        _thread.start_new_thread(avg_frames, (args, write_buffer, lastframe, cpuOut, cnt, exitmutexes[-1]))
         cnt += 1
+    else:
+        output = make_inference(I0, I1, args.multi-1)
+        write_buffer.put([cnt, lastframe])
+        cnt += 1
+        for mid in output:
+            mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+            # print(f"Adding #{cnt} to buffer.")
+            write_buffer.put([cnt, mid[:h, :w]])
+            cnt += 1
 
     lastframe = frame
+
+for mutex in exitmutexes:
+    while not mutex.locked(): pass
 write_buffer.put([cnt, lastframe])
 import time
 while(not write_buffer.empty()):
     time.sleep(0.5)
+
 time.sleep(0.5)
