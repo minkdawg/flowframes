@@ -12,6 +12,7 @@ import skvideo.io
 from queue import Queue, Empty
 import shutil
 import base64
+import time
 warnings.filterwarnings("ignore")
 
 abspath = os.path.abspath(__file__)
@@ -145,11 +146,21 @@ def clear_write_buffer(user_args, write_buffer, thread_id):
         #print(f"{frameNum:08}:"+ imgBytes.decode('utf-8') + "\n\n\n\n")
         cv2.imwrite('{:0>8d}.{}'.format(frameNum, args.imgformat), img[:, :, ::-1], [cv2.IMWRITE_PNG_COMPRESSION, 2])
 
-def build_read_buffer(user_args, read_buffer, videogen):
+def build_read_buffer(user_args, read_buffer, videogen, frame_diff):
+    last_buffer = None
     for frame in videogen:
         if not user_args.input is None:
             img_path = os.path.join(user_args.input, frame)
+                
             frame = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
+
+            if (last_buffer is None):   
+                frame_diff.append(10000) 
+            else :
+                frame_diff.append(compareImg(frame, last_buffer))
+            last_buffer = frame
+
+
         read_buffer.put(frame)
     read_buffer.put(None)
     read_buffer.put(None) # additional empty frames to prevent lock when looking ahead for deduplication
@@ -192,7 +203,10 @@ padding = (0, pw - w, 0, ph - h)
 
 write_buffer = Queue(maxsize=args.rbuffer)
 read_buffer = Queue(maxsize=args.rbuffer)
-_thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
+dedup_buffer = Queue(maxsize=8)
+frame_diff = []
+nextFrame = []
+_thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen, frame_diff))
 
 for x in range(args.wthreads):
     _thread.start_new_thread(clear_write_buffer, (args, write_buffer, x))
@@ -200,14 +214,16 @@ for x in range(args.wthreads):
 I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
 exitmutexes = []
-nextFrame = None
+frame_number = 0
+ 
+time.sleep(1)
 
 while True:
-    if (nextFrame is None):
+    frame_number += 1
+    if (dedup_buffer.empty()):
         frame = read_buffer.get()
     else:
-        frame = nextFrame
-        nextFrame = None
+        frame = dedup_buffer.get()
     
     if frame is None:
         break
@@ -216,20 +232,30 @@ while True:
     
     I0 = I1
 
-    if (args.multi == 1 and compareImg(frame, lastframe) < 10): # duplicate frame
-        nextFrame = read_buffer.get()
-        if nextFrame is not None:
+    dupCount = 0
+    if (args.multi == 1 and dedup_buffer.empty()):
+        while ((len(frame_diff) >= frame_number+dupCount) and (frame_diff[frame_number-1+dupCount] < 10) and dupCount < 6): 
+            dupCount += 1
+        if (dupCount > 0 and dupCount <= 4):
+            print(f"Duplicate frames: {frame_number} {frame_diff[frame_number-1]} Count:{dupCount}.")
+            for x in range(dupCount): #skip duplicates and read next frame
+                nextFrame = read_buffer.get()
+            if nextFrame is None: #end of video
+                nextFrame = frame
             I1 = torch.from_numpy(np.transpose(nextFrame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
             I1 = pad_image(I1)
-            output = make_inference(I0, I1, 2-1)
-            for mid in output:
-                frame = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))[:h, :w]
+            output = make_inference(I0, I1, dupCount)
+            for mid in output: 
+                dedup_buffer.put((((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))[:h, :w])
+            dedup_buffer.put(nextFrame)
+            frame = dedup_buffer.get()
+            
  
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
 
     if (args.multi == 1): # Motion blur x16 100%
-        output = make_inference(I0, I1, 16-1, 1.00)
+        output = make_inference(I0, I1, 8-1, 1.00)
         cpuOut = []
         for mid in output:
             cpuOut.append((mid[0] * 255.).byte().cpu())
